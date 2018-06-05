@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
  <class>MainWindow</class>
-  <widget class="QMainWindow" name="MainWindow">
+ <widget class="QMainWindow" name="MainWindow">
   <property name="geometry">
    <rect>
     <x>0</x>
@@ -30,6 +30,12 @@
         <pointsize>12</pointsize>
        </font>
       </property>
+      <property name="iconSize">
+       <size>
+        <width>40</width>
+        <height>40</height>
+       </size>
+      </property>
       <property name="spacing">
        <number>1</number>
       </property>
@@ -48,13 +54,42 @@
       </property>
       <layout class="QGridLayout" name="gridLayout">
        <item row="0" column="0">
+        <widget class="QLabel" name="targetLabel">
+         <property name="maximumSize">
+          <size>
+           <width>100</width>
+           <height>16777215</height>
+          </size>
+         </property>
+         <property name="text">
+          <string>Destination drive:</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QComboBox" name="targetCombo">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>0</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>200</width>
+           <height>16777215</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="0" colspan="3">
         <widget class="QLabel" name="neededLabel">
          <property name="text">
           <string>Needed:</string>
          </property>
         </widget>
        </item>
-       <item row="1" column="0">
+       <item row="2" column="0" colspan="3">
         <widget class="QLabel" name="availableLabel">
          <property name="text">
           <string>Available:</string>
@@ -90,6 +125,7 @@
    </attribute>
    <addaction name="actionWrite_image_to_disk"/>
    <addaction name="actionEdit_config"/>
+   <addaction name="actionWifi"/>
    <addaction name="actionBrowser"/>
    <addaction name="actionCancel"/>
   </widget>
@@ -186,6 +222,24 @@
    </property>
    <property name="shortcut">
     <string notr="true">H</string>
+   </property>
+  </action>
+  <action name="actionWifi">
+   <property name="enabled">
+    <bool>false</bool>
+   </property>
+   <property name="icon">
+    <iconset resource="icons.qrc">
+     <normaloff>:/icons/network-wireless.png</normaloff>:/icons/network-wireless.png</iconset>
+   </property>
+   <property name="text">
+    <string>Wifi networks (w)</string>
+   </property>
+   <property name="toolTip">
+    <string>Select a wifi network to connect to</string>
+   </property>
+   <property name="shortcut">
+    <string>W</string>
    </property>
   </action>
  </widget>

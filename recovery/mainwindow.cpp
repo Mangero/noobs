@@ -9,6 +9,7 @@
 #include "json.h"
 #include "util.h"
 #include "twoiconsdelegate.h"
+#include "wifisettingsdialog.h"
 #include <QMessageBox>
 #include <QProgressDialog>
 #include <QMap>
@@ -29,6 +30,10 @@
 #include <QtNetwork/QNetworkRequest>
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QNetworkDiskCache>
+#include <QtNetwork/QNetworkInterface>
+#include <QtNetwork/QNetworkConfigurationManager>
+#include <QtDBus/QDBusConnection>
+#include <QHostInfo>
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -36,6 +41,9 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <inttypes.h>
+#include <sys/reboot.h>
+#include <linux/reboot.h>
+#include <sys/time.h>
 
 #ifdef Q_WS_QWS
 #include <QWSServer>
@@ -61,12 +69,12 @@ bool MainWindow::_partInited = false;
 /* Flag to keep track of current display mode. */
 int MainWindow::_currentMode = 0;
 
-MainWindow::MainWindow(const QString &defaultDisplay, QSplashScreen *splash, QWidget *parent) :
+MainWindow::MainWindow(const QString &drive, const QString &defaultDisplay, QSplashScreen *splash, QWidget *parent) :
     QMainWindow(parent),
     ui(new Ui::MainWindow),
     _qpd(NULL), _kcpos(0), _defaultDisplay(defaultDisplay),
-    _silent(false), _allowSilent(false), _splash(splash), _settings(NULL),
-    _activatedEth(false), _numInstalledOS(0), _netaccess(NULL), _displayModeBox(NULL)
+    _silent(false), _allowSilent(false), _showAll(false), _fixate(false), _splash(splash), _settings(NULL),
+    _hasWifi(false), _numInstalledOS(0), _devlistcount(0), _netaccess(NULL), _displayModeBox(NULL), _drive(drive), _bootdrive(drive)
 {
     ui->setupUi(this);
     setWindowFlags(Qt::Window | Qt::CustomizeWindowHint | Qt::WindowTitleHint);
@@ -91,7 +99,7 @@ MainWindow::MainWindow(const QString &defaultDisplay, QSplashScreen *splash, QWi
         _qpd->setWindowModality(Qt::WindowModal);
         _qpd->setWindowFlags(Qt::Window | Qt::CustomizeWindowHint | Qt::WindowTitleHint);
 
-        InitDriveThread *idt = new InitDriveThread(this);
+        InitDriveThread *idt = new InitDriveThread(_bootdrive, this);
         connect(idt, SIGNAL(statusUpdate(QString)), _qpd, SLOT(setLabelText(QString)));
         connect(idt, SIGNAL(completed()), _qpd, SLOT(deleteLater()));
         connect(idt, SIGNAL(error(QString)), this, SLOT(onError(QString)));
@@ -104,7 +112,110 @@ MainWindow::MainWindow(const QString &defaultDisplay, QSplashScreen *splash, QWi
         setEnabled(true);
     }
 
-    if (getFileContents("/proc/cmdline").contains("silentinstall"))
+    /* Make sure the SD card is ready, and partition table is read by Linux */
+    QByteArray settingsPartition = partdev(_bootdrive, SETTINGS_PARTNR);
+    if (!QFile::exists(settingsPartition))
+    {
+        _qpd = new QProgressDialog( tr("Waiting for SD card (settings partition)"), QString(), 0, 0, this);
+        _qpd->setWindowModality(Qt::WindowModal);
+        _qpd->setWindowFlags(Qt::Window | Qt::CustomizeWindowHint | Qt::WindowTitleHint);
+        _qpd->show();
+
+        while (!QFile::exists(settingsPartition))
+        {
+            QApplication::processEvents(QEventLoop::WaitForMoreEvents, 250);
+        }
+        _qpd->hide();
+        _qpd->deleteLater();
+    }
+
+    _qpd = new QProgressDialog( tr("Mounting settings partition"), QString(), 0, 0, this);
+    _qpd->setWindowModality(Qt::WindowModal);
+    _qpd->setWindowFlags(Qt::Window | Qt::CustomizeWindowHint | Qt::WindowTitleHint);
+    _qpd->show();
+    QApplication::processEvents();
+
+    if (QProcess::execute("mount -t ext4 "+settingsPartition+" /settings") != 0)
+    {
+        _qpd->hide();
+
+        if (QMessageBox::question(this,
+                                  tr("Error mounting settings partition"),
+                                  tr("Persistent settings partition seems corrupt. Reformat?"),
+                                  QMessageBox::Yes, QMessageBox::No) == QMessageBox::Yes)
+        {
+            QProcess::execute("umount /settings");
+            if (QProcess::execute("/usr/sbin/mkfs.ext4 "+settingsPartition) != 0
+                || QProcess::execute("mount "+settingsPartition+" /settings") != 0)
+            {
+                QMessageBox::critical(this, tr("Reformat failed"), tr("SD card might be damaged"), QMessageBox::Close);
+            }
+
+            rebuildInstalledList();
+        }
+    }
+    _qpd->hide();
+    _qpd->deleteLater();
+    _qpd = NULL;
+    QProcess::execute("mount -o ro -t vfat "+partdev(_bootdrive, 1)+" /mnt");
+
+    _model = getFileContents("/proc/device-tree/model");
+    QString cmdline = getFileContents("/proc/cmdline");
+
+    if (QFile::exists("/mnt/os_list_v3.json"))
+    {
+        /* We have a local os_list_v3.json for testing purposes */
+        _repo = "/mnt/os_list_v3.json";
+
+        /* We need a somewhat accurate date for https to work. Normally we retrieve that from the repo server,
+           but since we are in testing mode, just set date to last modification time of our local file */
+        if (QDate::currentDate().year() < 2016)
+        {
+            QFileInfo fi(_repo);
+
+            struct timeval tv;
+            tv.tv_sec = fi.lastModified().toTime_t();
+            tv.tv_usec = 0;
+            settimeofday(&tv, NULL);
+        }
+    }
+    else if (cmdline.contains("repo="))
+    {
+        QByteArray searchFor = "repo=";
+        int searchForLen = searchFor.length();
+        int pos = cmdline.indexOf(searchFor);
+        int end;
+
+        if (cmdline.length() > pos+searchForLen && cmdline.at(pos+searchForLen) == '"')
+        {
+            /* Value between quotes */
+            searchForLen++;
+            end = cmdline.indexOf('"', pos+searchForLen);
+        }
+        else
+        {
+            end = cmdline.indexOf(' ', pos+searchForLen);
+        }
+        if (end != -1)
+            end = end-pos-searchForLen;
+        _repo = cmdline.mid(pos+searchForLen, end);
+    }
+    else
+    {
+        _repo = DEFAULT_REPO_SERVER;
+    }
+
+    _usbimages = !cmdline.contains("disableusbimages");
+
+    if (cmdline.contains("showall"))
+    {
+        _showAll = true;
+    }
+    if (cmdline.contains("fixate"))
+    {
+        _fixate = true;
+    }
+    if (cmdline.contains("silentinstall"))
     {
         /* If silentinstall is specified, auto-install single image in /os */
         _allowSilent = true;
@@ -117,6 +228,11 @@ MainWindow::MainWindow(const QString &defaultDisplay, QSplashScreen *splash, QWi
     /* Disable online help buttons until network is functional */
     ui->actionBrowser->setEnabled(false);
     QTimer::singleShot(1, this, SLOT(populate()));
+
+    ui->targetLabel->setHidden(true);
+    ui->targetCombo->setHidden(true);
+    connect(&_piDrivePollTimer, SIGNAL(timeout()), SLOT(pollForNewDisks()));
+    _piDrivePollTimer.start(100);
 }
 
 MainWindow::~MainWindow()
@@ -125,70 +241,41 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-/* Mount FAT partition, discover which images we have, and fill in the list */
+/* Discover which images we have, and fill in the list */
 void MainWindow::populate()
 {
-    if (!QFile::exists("/dev/mmcblk0p1"))
-    {
-        // mmcblk0p1 not ready yet, check back in a tenth of a second
-        QTimer::singleShot(100, this, SLOT(populate()));
-        return;
-    }
-
     /* Ask user to wait while list is populated */
     if (!_allowSilent)
     {
         _qpd = new QProgressDialog(tr("Please wait while NOOBS initialises"), QString(), 0, 0, this);
         _qpd->setWindowFlags(Qt::Window | Qt::CustomizeWindowHint | Qt::WindowTitleHint);
         _qpd->show();
-        QTimer::singleShot(2000, this, SLOT(hideDialogIfNoNetwork()));
+
+        int timeout = 5000;
+        if (getFileContents("/settings/wpa_supplicant.conf").contains("ssid="))
+        {
+            /* Longer timeout if we have a wifi network configured */
+            timeout = 8000;
+        }
+        QTimer::singleShot(timeout, this, SLOT(hideDialogIfNoNetwork()));
+        _time.start();
     }
 
-    if (QFile::exists(SETTINGS_PARTITION))
+    _settings = new QSettings("/settings/noobs.conf", QSettings::IniFormat, this);
+
+    /* Restore saved display mode */
+    qDebug() << "Default display mode is " << _defaultDisplay;
+    int mode = _settings->value("display_mode", _defaultDisplay).toInt();
+    if (mode)
     {
-        /* Try mounting read-only first, if fails try read-write as it may recover from journal */
-        if (QProcess::execute("mount -o remount,ro /settings")!=0
-            && QProcess::execute("mount -o remount,rw /settings")!=0)
-        {
-            if (QMessageBox::question(this,
-                                      tr("Error mounting settings partition"),
-                                      tr("Persistent settings partition seems corrupt. Reformat?"),
-                                      QMessageBox::Yes, QMessageBox::No) == QMessageBox::Yes)
-            {
-                QProcess::execute("umount /settings");
-                if (QProcess::execute("/usr/sbin/mkfs.ext4 " SETTINGS_PARTITION) != 0
-                    || QProcess::execute("mount " SETTINGS_PARTITION " /settings") != 0)
-                {
-                    QMessageBox::critical(this, tr("Reformat failed"), tr("SD card might be damaged"), QMessageBox::Close);
-                }
-
-                rebuildInstalledList();
-                QProcess::execute("mount -o remount,ro " SETTINGS_PARTITION);
-            }
-        }
-
-        _settings = new QSettings("/settings/noobs.conf", QSettings::IniFormat, this);
-
-        /* Restore saved display mode */
-        qDebug() << "Default display mode is " << _defaultDisplay;
-        int mode = _settings->value("display_mode", _defaultDisplay).toInt();
-        if (mode)
-        {
-            displayMode(mode, true);
-        }
-        QProcess::execute("mount -o remount,rw /settings");
-        _settings->setValue("display_mode", _defaultDisplay);
-        _settings->sync();
-        QProcess::execute("mount -o remount,ro /settings");
-
+        displayMode(mode, true);
     }
-
-
-    QProcess::execute("mount -o ro -t vfat /dev/mmcblk0p1 /mnt");
+    _settings->setValue("display_mode", _defaultDisplay);
+    _settings->sync();
 
     // Fill in list of images
     repopulate();
-    _availableMB = (getFileContents("/sys/class/block/mmcblk0p3/start").trimmed().toULongLong()-getFileContents("/sys/class/block/mmcblk0p2/start").trimmed().toULongLong())/2048;
+    _availableMB = (getFileContents(sysclassblock(_drive)+"/size").trimmed().toULongLong()-getFileContents(sysclassblock(_drive, 5)+"/start").trimmed().toULongLong()-getFileContents(sysclassblock(_drive, 5)+"/size").trimmed().toULongLong())/2048;
     updateNeeded();
 
     if (ui->list->count() != 0)
@@ -204,23 +291,18 @@ void MainWindow::populate()
             ui->list->setCurrentRow(0);
         }
 
-        if (_allowSilent && !QFile::exists(FAT_PARTITION_OF_IMAGE) && ui->list->count() == 1)
+        if (_allowSilent && !_numInstalledOS && ui->list->count() == 1)
         {
             // No OS installed, perform silent installation
             qDebug() << "Performing silent installation";
             _silent = true;
             ui->list->item(0)->setCheckState(Qt::Checked);
             on_actionWrite_image_to_disk_triggered();
+            _numInstalledOS = 1;
         }
     }
 
-    bool osInstalled = QFile::exists(FAT_PARTITION_OF_IMAGE);
-    ui->actionCancel->setEnabled(osInstalled);
-}
-
-void MainWindow::remountSettingsRW()
-{
-    QProcess::execute("mount -o remount,rw /settings");
+    ui->actionCancel->setEnabled(_numInstalledOS > 0);
 }
 
 void MainWindow::repopulate()
@@ -327,10 +409,21 @@ void MainWindow::repopulate()
             }
         }
     }
+
+    if (_numInstalledOS)
+    {
+        ui->actionCancel->setEnabled(true);
+        if (_fixate)
+        {
+            ui->list->setEnabled(false);
+        }
+    }
+
+    filterList();
 }
 
 /* Whether this OS should be displayed in the list of installable OSes */
-bool canInstallOs(const QString& name, const QVariantMap& values)
+bool MainWindow::canInstallOs(const QString &name, const QVariantMap &values)
 {
     /* Can't simply pull "name" from "values" because in some JSON files it's "os_name" and in others it's "name" */
 
@@ -349,11 +442,19 @@ bool canInstallOs(const QString& name, const QVariantMap& values)
         }
     }
 
-    return true;
+    /* Display OS in list if it is supported or "showall" is specified in recovery.cmdline */
+    if (_showAll)
+    {
+        return true;
+    }
+    else
+    {
+        return isSupportedOs(name, values);
+    }
 }
 
 /* Whether this OS is supported */
-bool isSupportedOs(const QString& name, const QVariantMap& values)
+bool MainWindow::isSupportedOs(const QString &name, const QVariantMap &values)
 {
     /* Can't simply pull "name" from "values" because in some JSON files it's "os_name" and in others it's "name" */
 
@@ -363,75 +464,37 @@ bool isSupportedOs(const QString& name, const QVariantMap& values)
         return true;
     }
 
-    uint board_revision = readBoardRevision();
-    if (values.find("supported_revisions") != values.end())
+    if (values.contains("supported_models"))
     {
-        /* Check the supported revisions list */
-        QStringList revisions = values.value("supported_revisions").toString().remove(" ").split(",");
-        for (int i=0; i < revisions.size(); i++)
+        QStringList supportedModels = values.value("supported_models").toStringList();
+
+        foreach (QString m, supportedModels)
         {
-            bool ok;
-            uint rev = revisions.at(i).toUInt(&ok, 10);
-            if (ok)
+            /* Check if the full formal model name (e.g. "Raspberry Pi 2 Model B Rev 1.1")
+             * contains the string we are told to look for (e.g. "Pi 2") */
+            if (_model.contains(m, Qt::CaseInsensitive))
             {
-                if ((rev & 0xffff) == (board_revision & 0xffff))
-                {
-                    return true;
-                }
+                return true;
             }
         }
+
         return false;
-    }
-    else if (values.find("supported_hex_revisions") != values.end())
-    {
-        /* Check the supported revisions list */
-        QStringList revisions = values.value("supported_hex_revisions").toString().remove(" ").split(",");
-        for (int i=0; i < revisions.size(); i++)
-        {
-            bool ok;
-            uint rev = revisions.at(i).toUInt(&ok, 16);
-            if (ok)
-            {
-                if ((rev & 0xffff) == (board_revision & 0xffff))
-                {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-    else
-    {
-        /* Check the feature_level flag */
-        if (board_revision < 64) /* overflow otherwise */
-        {
-            quint64 featurelevel = values.value("feature_level", 58364).toULongLong();
-            quint64 mask = (quint64)1 << board_revision;
-            if ((featurelevel & mask) != mask)
-            {
-                return false;
-            }
-        }
-        else
-        {
-            return false;
-        }
     }
 
     return true;
 }
 
-QMap<QString, QVariantMap> MainWindow::listImages()
+QMap<QString, QVariantMap> MainWindow::listImages(const QString &folder, bool includeInstalled)
 {
     QMap<QString,QVariantMap> images;
 
     /* Local image folders */
-    QDir dir("/mnt/os", "", QDir::Name, QDir::Dirs | QDir::NoDotAndDotDot);
+    QDir dir(folder, "", QDir::Name, QDir::Dirs | QDir::NoDotAndDotDot);
     QStringList list = dir.entryList();
 
     foreach (QString image,list)
     {
-        QString imagefolder = "/mnt/os/"+image;
+        QString imagefolder = folder+"/"+image;
         if (!QFile::exists(imagefolder+"/os.json"))
             continue;
         QVariantMap osv = Json::loadFromFile(imagefolder+"/os.json").toMap();
@@ -472,7 +535,7 @@ QMap<QString, QVariantMap> MainWindow::listImages()
     }
 
     /* Also add information about files already installed */
-    if (_settings)
+    if (_settings && includeInstalled)
     {
         QVariantList i = Json::loadFromFile("/settings/installed_os.json").toList();
         foreach (QVariant v, i)
@@ -519,11 +582,13 @@ QMap<QString, QVariantMap> MainWindow::listImages()
 
 void MainWindow::on_actionWrite_image_to_disk_triggered()
 {
-    remountSettingsRW();
+    QString warning = tr("Warning: this will install the selected Operating System(s). All existing data on the SD card will be overwritten, including any OSes that are already installed.");
+    if (_drive != "mmcblk0")
+        warning.replace(tr("SD card"), tr("drive"));
 
     if (_silent || QMessageBox::warning(this,
                                         tr("Confirm"),
-                                        tr("Warning: this will install the selected Operating System(s). All existing data on the SD card will be overwritten, including any OSes that are already installed."),
+                                        warning,
                                         QMessageBox::Yes, QMessageBox::No) == QMessageBox::Yes)
     {
         /* See if any of the OSes are unsupported */
@@ -547,6 +612,8 @@ void MainWindow::on_actionWrite_image_to_disk_triggered()
         {
             setEnabled(false);
             _numMetaFilesToDownload = 0;
+            if (_networkStatusPollTimer.isActive())
+                _networkStatusPollTimer.stop();
 
             QList<QListWidgetItem *> selected = selectedItems();
             foreach (QListWidgetItem *item, selected)
@@ -598,11 +665,9 @@ void MainWindow::on_actionCancel_triggered()
 void MainWindow::onCompleted()
 {
     _qpd->hide();
-    QProcess::execute("mount -o remount,rw /settings");
     QSettings settings("/settings/noobs.conf", QSettings::IniFormat, this);
     settings.setValue("default_partition_to_boot", "800");
     settings.sync();
-    QProcess::execute("mount -o remount,ro /settings");
 
     if (!_silent)
         QMessageBox::information(this,
@@ -615,16 +680,16 @@ void MainWindow::onCompleted()
 
 void MainWindow::onError(const QString &msg)
 {
-    _qpd->hide();
+    qDebug() << "Error:" << msg;
+    if (_qpd)
+        _qpd->hide();
     QMessageBox::critical(this, tr("Error"), msg, QMessageBox::Close);
     setEnabled(true);
 }
 
 void MainWindow::onQuery(const QString &msg, const QString &title, QMessageBox::StandardButton* answer)
 {
-    _qpd->hide();
     *answer = QMessageBox::question(this, title, msg, QMessageBox::Yes|QMessageBox::No);
-    setEnabled(true);
 }
 
 void MainWindow::on_list_currentRowChanged()
@@ -726,7 +791,7 @@ void MainWindow::displayMode(int modenr, bool silent)
     QWSServer::instance()->refresh();
 
     // In case they can't see the message box, inform that mode change
-    // is occuring by turning on the LED during the change
+    // is occurring by turning on the LED during the change
     QProcess *led_blink = new QProcess(this);
     connect(led_blink, SIGNAL(finished(int)), led_blink, SLOT(deleteLater()));
     led_blink->start("sh -c \"echo 1 > /sys/class/leds/led0/brightness; sleep 3; echo 0 > /sys/class/leds/led0/brightness\"");
@@ -743,7 +808,6 @@ void MainWindow::displayMode(int modenr, bool silent)
 
         if (_displayModeBox->standardButton(_displayModeBox->clickedButton()) == QMessageBox::Yes)
         {
-            remountSettingsRW();
             _settings->setValue("display_mode", modenr);
             _settings->sync();
             ::sync();
@@ -831,19 +895,18 @@ void MainWindow::on_actionAdvanced_triggered(bool checked)
 
 void MainWindow::on_actionEdit_config_triggered()
 {
-    /* If no installed OS is selected, default to first extended partition */
-    QString partition = FAT_PARTITION_OF_IMAGE;
     QListWidgetItem *item = ui->list->currentItem();
 
     if (item && item->data(Qt::UserRole).toMap().contains("partitions"))
     {
         QVariantList l = item->data(Qt::UserRole).toMap().value("partitions").toList();
         if (!l.isEmpty())
-            partition = l.first().toString();
+        {
+            QString partition = l.first().toString();
+            ConfEditDialog d(partition);
+            d.exec();
+        }
     }
-
-    ConfEditDialog d(partition);
-    d.exec();
 }
 
 void MainWindow::on_actionBrowser_triggered()
@@ -853,7 +916,7 @@ void MainWindow::on_actionBrowser_triggered()
 
 bool MainWindow::requireNetwork()
 {
-    if (!QFile::exists("/tmp/resolv.conf"))
+    if (!isOnline())
     {
         QMessageBox::critical(this,
                               tr("No network access"),
@@ -871,7 +934,7 @@ void MainWindow::startBrowser()
         return;
     QProcess *proc = new QProcess(this);
     QString lang = LanguageDialog::instance("en", "gb")->currentLanguage();
-    if (lang == "gb" || lang == "us" || lang == "")
+    if (lang == "gb" || lang == "us" || lang == "ar" || lang == "")
         lang = "en";
     proc->start("arora -lang "+lang+" "+HOMEPAGE);
 }
@@ -890,43 +953,87 @@ void MainWindow::on_list_doubleClicked(const QModelIndex &index)
 
 void MainWindow::startNetworking()
 {
-    if (!QFile::exists("/sys/class/net/eth0"))
-    {
-        /* eth0 not available yet, check back in a tenth of a second */
-        QTimer::singleShot(100, this, SLOT(startNetworking()));
-        return;
-    }
+    QFile f("/settings/wpa_supplicant.conf");
 
-    QByteArray carrier = getFileContents("/sys/class/net/eth0/carrier").trimmed();
-    if (carrier.isEmpty() && !_activatedEth)
+    if ( f.exists() && f.size() == 0 )
     {
-        QProcess::execute("/sbin/ifconfig eth0 up");
-        _activatedEth = true;
+        /* Remove corrupt file */
+        f.remove();
     }
-
-    if (carrier != "1")
+    if ( !f.exists() )
     {
-        /* cable not detected yet, check back in a tenth of a second */
-        QTimer::singleShot(100, this, SLOT(startNetworking()));
-        return;
+        /* If user supplied a wpa_supplicant.conf on the FAT partition copy that one to settings
+           otherwise copy the default one stored in the initramfs */
+        if (QFile::exists("/mnt/wpa_supplicant.conf"))
+            QFile::copy("/mnt/wpa_supplicant.conf", "/settings/wpa_supplicant.conf");
+        else
+        {
+            qDebug() << "Copying /etc/wpa_supplicant.conf to /settings/wpa_supplicant.conf";
+            QFile::copy("/etc/wpa_supplicant.conf", "/settings/wpa_supplicant.conf");
+        }
     }
+    QFile::remove("/etc/wpa_supplicant.conf");
 
+    /* Enable dbus so that we can use it to talk to wpa_supplicant later */
+    qDebug() << "Starting dbus";
+    QProcess::execute("/etc/init.d/S30dbus start");
+
+    /* Run dhcpcd in background */
     QProcess *proc = new QProcess(this);
-    connect(proc, SIGNAL(finished(int)), this, SLOT(ifupFinished(int)));
-    /* Try enabling interface twice as sometimes it times out before getting a DHCP lease */
-    proc->start("sh -c \"ifup eth0 || ifup eth0\"");
+    qDebug() << "Starting dhcpcd";
+    proc->start("/sbin/dhcpcd --noarp -e wpa_supplicant_conf=/settings/wpa_supplicant.conf --denyinterfaces \"*_ap\"");
+
+    if ( isOnline() )
+    {
+        onOnlineStateChanged(true);
+    }
+    else
+    {
+        /* We could ask Qt's Bearer management to notify us once we are online,
+           but it tends to poll every 10 seconds.
+           Users are not that patient, so lets poll ourselves every 0.1 second */
+        //QNetworkConfigurationManager *_netconfig = new QNetworkConfigurationManager(this);
+        //connect(_netconfig, SIGNAL(onlineStateChanged(bool)), this, SLOT(onOnlineStateChanged(bool)));
+        connect(&_networkStatusPollTimer, SIGNAL(timeout()), SLOT(pollNetworkStatus()));
+        _networkStatusPollTimer.start(100);
+    }
 }
 
-void MainWindow::ifupFinished(int)
+bool MainWindow::isOnline()
 {
-    QProcess *p = qobject_cast<QProcess*> (sender());
+    /* Check if we have an IP-address other than localhost */
+    QList<QHostAddress> addresses = QNetworkInterface::allAddresses();
 
-    if (QFile::exists("/etc/resolv.conf"))
+    foreach (QHostAddress a, addresses)
     {
-        qDebug() << "Network up";
+        if (a != QHostAddress::LocalHost && a != QHostAddress::LocalHostIPv6)
+            return true;
+    }
+
+    return false;
+}
+
+void MainWindow::pollNetworkStatus()
+{
+    if (!_hasWifi && QFile::exists("/sys/class/net/wlan0"))
+    {
+        _hasWifi = true;
+        ui->actionWifi->setEnabled(true);
+    }
+    if (isOnline())
+    {
+        _networkStatusPollTimer.stop();
+        onOnlineStateChanged(true);
+    }
+}
+
+void MainWindow::onOnlineStateChanged(bool online)
+{
+    if (online)
+    {
+        qDebug() << "Network up in" << _time.elapsed()/1000.0 << "seconds";
         if (!_netaccess)
         {
-            remountSettingsRW();
             QDir dir;
             dir.mkdir("/settings/cache");
             _netaccess = new QNetworkAccessManager(this);
@@ -934,20 +1041,34 @@ void MainWindow::ifupFinished(int)
             _cache->setCacheDirectory("/settings/cache");
             _cache->setMaximumCacheSize(8 * 1024 * 1024);
             _netaccess->setCache(_cache);
+            QNetworkConfigurationManager manager;
+            _netaccess->setConfiguration(manager.defaultConfiguration());
 
-            downloadList(DEFAULT_REPO_SERVER);
+            downloadLists();
         }
         ui->actionBrowser->setEnabled(true);
         emit networkUp();
     }
-
-    p->deleteLater();
 }
 
 void MainWindow::downloadList(const QString &urlstring)
 {
     QNetworkReply *reply = _netaccess->get(QNetworkRequest(QUrl(urlstring)));
     connect(reply, SIGNAL(finished()), this, SLOT(downloadListRedirectCheck()));
+}
+
+void MainWindow::downloadLists()
+{
+    _numIconsToDownload = 0;
+    QStringList urls = _repo.split(' ', QString::SkipEmptyParts);
+
+    foreach (QString url, urls)
+    {
+        if (url.startsWith("/"))
+            processJson( Json::parse(getFileContents(url)) );
+        else
+            downloadList(url);
+    }
 }
 
 void MainWindow::rebuildInstalledList()
@@ -962,7 +1083,7 @@ void MainWindow::rebuildInstalledList()
 
     for (int i=5; i<=MAXIMUM_PARTITIONS; i++)
     {
-        QString part = "/dev/mmcblk0p"+QString::number(i);
+        QString part = partdev(_drive, i);
 
         if (QFile::exists(part) && QProcess::execute("mount -t vfat "+part+" /mnt2") == 0)
         {
@@ -998,9 +1119,26 @@ void MainWindow::downloadListComplete()
     QNetworkReply *reply = qobject_cast<QNetworkReply *>(sender());
     int httpstatuscode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
 
+    /* Set our clock to server time if we currently have a date before 2015 */
+    QByteArray dateStr = reply->rawHeader("Date");
+    if (!dateStr.isEmpty() && QDate::currentDate().year() < 2015)
+    {
+        // Qt 4 does not have a standard function for parsing the Date header, but it does
+        // have one for parsing a Last-Modified header that uses the same date/time format, so just use that
+        QNetworkRequest dummyReq;
+        dummyReq.setRawHeader("Last-Modified", dateStr);
+        QDateTime parsedDate = dummyReq.header(dummyReq.LastModifiedHeader).toDateTime();
+
+        struct timeval tv;
+        tv.tv_sec = parsedDate.toTime_t();
+        tv.tv_usec = 0;
+        settimeofday(&tv, NULL);
+    }
+
     if (reply->error() != reply->NoError || httpstatuscode < 200 || httpstatuscode > 399)
     {
-        _qpd->hide();
+        if (_qpd)
+            _qpd->hide();
         QMessageBox::critical(this, tr("Download error"), tr("Error downloading distribution list from Internet"), QMessageBox::Close);
     }
     else
@@ -1061,10 +1199,9 @@ void MainWindow::processJson(QVariant json)
     }
 
     /* Download icons */
-    _numIconsToDownload = iconurls.count();
-
-    if (_numIconsToDownload)
+    if (!iconurls.isEmpty())
     {
+         _numIconsToDownload += iconurls.count();
         foreach (QString iconurl, iconurls)
         {
             downloadIcon(iconurl, iconurl);
@@ -1078,6 +1215,8 @@ void MainWindow::processJson(QVariant json)
             _qpd = NULL;
         }
     }
+
+    filterList();
 }
 
 void MainWindow::processJsonOs(const QString &name, QVariantMap &new_details, QSet<QString> &iconurls)
@@ -1103,7 +1242,7 @@ void MainWindow::processJsonOs(const QString &name, QVariantMap &new_details, QS
         }
 
     }
-    else
+    else if (!_fixate || _numInstalledOS == 0)
     {
         /* It's a new OS, so add it to the list */
         QString iconurl = new_details.value("icon").toString();
@@ -1226,8 +1365,11 @@ void MainWindow::updateNeeded()
         if (nameMatchesRiscOS(entry.value("name").toString()))
         {
             /* RiscOS needs to start at a predetermined sector, calculate the extra space needed for that */
-            int startSector = getFileContents("/sys/class/block/mmcblk0p2/start").trimmed().toULongLong();
-            _neededMB += (RISCOS_SECTOR_OFFSET - startSector)/2048;
+            int startSector = getFileContents(sysclassblock(_drive, 5)+"/start").trimmed().toULongLong()+getFileContents(sysclassblock(_drive, 5)+"/size").trimmed().toULongLong();
+            if (RISCOS_SECTOR_OFFSET > startSector)
+            {
+                _neededMB += (RISCOS_SECTOR_OFFSET - startSector)/2048;
+            }
         }
     }
 
@@ -1286,7 +1428,6 @@ void MainWindow::downloadListRedirectCheck()
     if (httpstatuscode > 300 && httpstatuscode < 400)
     {
         qDebug() << "Redirection - Re-trying download from" << redirectionurl;
-        _numMetaFilesToDownload--;
         downloadList(redirectionurl);
     }
     else
@@ -1303,7 +1444,6 @@ void MainWindow::downloadIconRedirectCheck()
     if (httpstatuscode > 300 && httpstatuscode < 400)
     {
         qDebug() << "Redirection - Re-trying download from" << redirectionurl;
-        _numMetaFilesToDownload--;
         downloadIcon(redirectionurl, originalurl);
     }
     else
@@ -1375,7 +1515,7 @@ void MainWindow::downloadMetaComplete()
 void MainWindow::startImageWrite()
 {
     /* All meta files downloaded, extract slides tarball, and launch image writer thread */
-    MultiImageWriteThread *imageWriteThread = new MultiImageWriteThread();
+    MultiImageWriteThread *imageWriteThread = new MultiImageWriteThread(_bootdrive, _drive);
     QString folder, slidesFolder;
     QStringList slidesFolders;
 
@@ -1436,13 +1576,14 @@ void MainWindow::startImageWrite()
     if (slidesFolders.isEmpty())
         slidesFolder.append("/mnt/defaults/slides");
 
-    _qpd = new ProgressSlideshowDialog(slidesFolders, "", 20, this);
+    _qpd = new ProgressSlideshowDialog(slidesFolders, "", 20, _drive, this);
     connect(imageWriteThread, SIGNAL(parsedImagesize(qint64)), _qpd, SLOT(setMaximum(qint64)));
     connect(imageWriteThread, SIGNAL(completed()), this, SLOT(onCompleted()));
     connect(imageWriteThread, SIGNAL(error(QString)), this, SLOT(onError(QString)));
     connect(imageWriteThread, SIGNAL(statusUpdate(QString)), _qpd, SLOT(setLabelText(QString)));
     connect(imageWriteThread, SIGNAL(runningMKFS()), _qpd, SLOT(pauseIOaccounting()), Qt::BlockingQueuedConnection);
     connect(imageWriteThread, SIGNAL(finishedMKFS()), _qpd , SLOT(resumeIOaccounting()), Qt::BlockingQueuedConnection);
+    connect(imageWriteThread, SIGNAL(newDrive(const QString&)), _qpd , SLOT(changeDrive(const QString&)), Qt::BlockingQueuedConnection);
     imageWriteThread->start();
     hide();
     _qpd->exec();
@@ -1452,8 +1593,7 @@ void MainWindow::hideDialogIfNoNetwork()
 {
     if (_qpd)
     {
-        QByteArray carrier = getFileContents("/sys/class/net/eth0/carrier").trimmed();
-        if (carrier != "1")
+        if (!isOnline())
         {
             /* No network cable inserted */
             _qpd->hide();
@@ -1463,10 +1603,283 @@ void MainWindow::hideDialogIfNoNetwork()
             if (ui->list->count() == 0)
             {
                 /* No local images either */
-                QMessageBox::critical(this,
-                                      tr("No network access"),
-                                      tr("Wired network access is required to use NOOBS without local images. Please insert a network cable into the network port."),
-                                      QMessageBox::Close);
+                if (_hasWifi)
+                {
+                    QMessageBox::critical(this,
+                                          tr("No network access"),
+                                          tr("Network access is required to use NOOBS without local images. Please select your wifi network in the next screen."),
+                                          QMessageBox::Close);
+                    on_actionWifi_triggered();
+                }
+                else
+                {
+                    QMessageBox::critical(this,
+                                          tr("No network access"),
+                                          tr("Wired network access is required to use NOOBS without local images. Please insert a network cable into the network port."),
+                                          QMessageBox::Close);
+                }
+            }
+        }
+    }
+}
+
+void MainWindow::on_actionWifi_triggered()
+{
+    bool wasAlreadyOnlineBefore = !_networkStatusPollTimer.isActive();
+
+    WifiSettingsDialog wsd;
+    if ( wsd.exec() == wsd.Accepted )
+    {
+        if (wasAlreadyOnlineBefore)
+        {
+            /* Try to redownload list. Could have failed through previous access point */
+            downloadLists();
+        }
+    }
+}
+
+void MainWindow::pollForNewDisks()
+{
+    QString dirname = "/sys/class/block";
+    QDir dir(dirname);
+    QStringList list = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+
+    if (list.count() != _devlistcount)
+    {
+        foreach (QString devname, list)
+        {
+            QString blocklink = QFile::symLinkTarget(dirname+"/"+devname);
+            /* skip virtual things and partitions */
+            if (blocklink.contains("/devices/virtual/") || QFile::exists(blocklink+"/partition") )
+                continue;
+
+            QByteArray inflight = getFileContents(sysclassblock(devname)+"/inflight").trimmed();
+            if (inflight.count() && inflight.left(1) != "0")
+            {
+                /* There are currently outstanding IO request, which could mean it hasn't finished
+                 * reading the partition table. Check again on next round */
+                return;
+            }
+
+            /* does the drive perhaps have a FAT partition with extra images? */
+            if ("/dev/"+devname != _bootdrive && QFile::exists(sysclassblock(devname, 1)))
+            {
+                QString p1 = partdev(devname, 1);
+
+                if (!QFile::exists("/dev/"+p1))
+                {
+                    /* /dev node not created yet. Check again on next round */
+                    return;
+                }
+
+                if (_usbimages && !QFile::exists("/tmp/media/"+p1))
+                    addImagesFromUSB(p1);
+            }
+
+            /* is the drive writable? */
+            if (getFileContents(blocklink+"/ro").trimmed() == "1")
+                continue;
+
+            QString model = getFileContents(dirname+"/"+devname+"/device/model").trimmed();
+            if (model.isEmpty())
+                model = getFileContents(dirname+"/"+devname+"/device/name").trimmed();
+            QIcon icon;
+
+            if (devname.startsWith("mmc"))
+            {
+                icon = QIcon(":/icons/hdd.png");
+            }
+            else
+            {
+                icon = QIcon(":/icons/hdd_usb_unmount.png");
+            }
+
+            if (ui->targetCombo->findData(devname) == -1)
+            {
+                ui->targetCombo->addItem(icon, devname+": "+model, devname);
+
+                /* does the partition structure look like a preloaded Pi drive, then select it by default? */
+                if (devname == "sda"
+                        && QFile::exists(sysclassblock(devname, 1))
+                        && QFile::exists(sysclassblock(devname, 5))
+                        && getFileContents(sysclassblock(devname, 5)+"/size").trimmed().toInt() == SETTINGS_PARTITION_SIZE)
+                    ui->targetCombo->setCurrentIndex(ui->targetCombo->count()-1);
+            }
+        }
+
+        if (ui->targetCombo->count() > 1)
+        {
+            ui->targetLabel->setHidden(false);
+            ui->targetCombo->setHidden(false);
+        }
+
+        _devlistcount = list.count();
+    }
+}
+
+void MainWindow::on_targetCombo_currentIndexChanged(int index)
+{
+    if (index != -1)
+    {
+        QString devname = ui->targetCombo->itemData(index).toString();
+
+        if (devname != "mmcblk0" && (
+                   !QFile::exists(sysclassblock(devname, 1))
+                || !QFile::exists(sysclassblock(devname, 5))
+                || getFileContents(sysclassblock(devname, 5)+"/size").trimmed().toInt() != SETTINGS_PARTITION_SIZE))
+        {
+            if (QMessageBox::question(this,
+                                      tr("Reformat drive?"),
+                                      tr("Are you sure you want to reformat the drive '%1' for use with NOOBS? All existing data on the drive will be deleted!").arg(devname),
+                                      QMessageBox::Yes, QMessageBox::No) == QMessageBox::Yes)
+            {
+                InitDriveThread idt("/dev/"+devname);
+                idt.formatUsbDrive();
+            }
+            else
+            {
+                int idx = ui->targetCombo->findData("mmcblk0");
+                if (idx != -1 && idx != index)
+                    ui->targetCombo->setCurrentIndex(idx);
+                return;
+            }
+        }
+
+        qDebug() << "New drive selected:" << devname;
+        _drive = "/dev/"+devname;
+        _availableMB = (getFileContents(sysclassblock(_drive)+"/size").trimmed().toULongLong()-getFileContents(sysclassblock(_drive, 5)+"/start").trimmed().toULongLong()-getFileContents(sysclassblock(_drive, 5)+"/size").trimmed().toULongLong())/2048;
+        filterList();
+        updateNeeded();
+    }
+}
+
+void MainWindow::addImagesFromUSB(const QString &device)
+{
+    QDir dir;
+    QString mntpath = "/tmp/media/"+device;
+
+    dir.mkpath(mntpath);
+    if (QProcess::execute("mount -o ro -t vfat /dev/"+device+" "+mntpath) != 0)
+    {
+        dir.rmdir(mntpath);
+        return;
+    }
+
+    if (!QFile::exists(mntpath+"/os"))
+    {
+        QProcess::execute("umount "+mntpath);
+        dir.rmdir(mntpath);
+        return;
+    }
+
+    QIcon usbIcon(":/icons/hdd_usb_unmount.png");
+    QMap<QString,QVariantMap> images = listImages(mntpath+"/os", false);
+
+    foreach (QVariant v, images.values())
+    {
+        QVariantMap m = v.toMap();
+        QString name = m.value("name").toString();
+        QString folder  = m.value("folder").toString();
+
+        QListWidgetItem *witem = findItem(name);
+        if (witem)
+        {
+            QVariantMap existing_details = witem->data(Qt::UserRole).toMap();
+
+            if ((existing_details["release_date"].toString() <= m["release_date"].toString()))
+            {
+                /* Existing item in list is same version or older. Prefer image on USB storage. */
+                m.insert("installed", existing_details.value("installed", false));
+                if (existing_details.contains("partitions"))
+                {
+                    m["partitions"] = existing_details["partitions"];
+                }
+                witem->setData(Qt::UserRole, m);
+                witem->setData(SecondIconRole, usbIcon);
+                ui->list->update();
+            }
+        }
+        else
+        {
+            /* It's a new OS, so add it to the list */
+            QString description = m.value("description").toString();
+            QString iconFilename = m.value("icon").toString();
+            bool recommended = m.value("recommended").toBool();
+
+            if (!iconFilename.isEmpty() && !iconFilename.contains('/'))
+                iconFilename = folder+"/"+iconFilename;
+            if (!QFile::exists(iconFilename))
+            {
+                iconFilename = folder+"/"+name+".png";
+                iconFilename.replace(' ', '_');
+            }
+
+            QString friendlyname = name;
+            if (recommended)
+                friendlyname += " ["+tr("RECOMMENDED")+"]";
+            if (!description.isEmpty())
+                friendlyname += "\n"+description;
+
+            witem = new QListWidgetItem(friendlyname);
+            witem->setCheckState(Qt::Unchecked);
+            witem->setData(Qt::UserRole, m);
+            witem->setData(SecondIconRole, usbIcon);
+            if (QFile::exists(iconFilename))
+                witem->setIcon(QIcon(iconFilename));
+
+            if (recommended)
+                ui->list->insertItem(0, witem);
+            else
+                ui->list->addItem(witem);
+        }
+    }
+
+    filterList();
+}
+
+/* Dynamically hide items from list depending on target drive */
+void MainWindow::filterList()
+{
+    for (int i=0; i < ui->list->count(); i++)
+    {
+        QListWidgetItem *witem = ui->list->item(i);
+
+        if (_drive == "/dev/mmcblk0")
+        {
+            witem->setHidden(false);
+        }
+        else
+        {
+            QVariantMap m = witem->data(Qt::UserRole).toMap();
+            bool supportsUsb;
+            QString param;
+
+            if (_bootdrive == "/dev/mmcblk0")
+                param = "supports_usb_root";
+            else
+                param = "supports_usb_boot";
+
+
+            /* If the repo explicity states wheter or not usb is supported use that info */
+            if (m.contains(param))
+            {
+                supportsUsb = m.value(param).toBool();
+            }
+            else
+            {
+                /* Otherwise just assume Linux does, and RiscOS and Windows do not */
+                QString name = m.value("name").toString();
+                supportsUsb = (!nameMatchesRiscOS(name) && !name.contains("Windows", Qt::CaseInsensitive));
+            }
+
+            if (supportsUsb)
+            {
+                witem->setHidden(false);
+            }
+            else
+            {
+                witem->setCheckState(Qt::Unchecked);
+                witem->setHidden(true);
             }
         }
     }

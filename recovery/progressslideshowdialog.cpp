@@ -1,5 +1,6 @@
 #include "progressslideshowdialog.h"
 #include "ui_progressslideshowdialog.h"
+#include "util.h"
 #include <QDir>
 #include <QFile>
 #include <QPixmap>
@@ -15,8 +16,9 @@
  *
  */
 
-ProgressSlideshowDialog::ProgressSlideshowDialog(const QStringList &slidesDirectories, const QString &statusMsg, int changeInterval, QWidget *parent) :
+ProgressSlideshowDialog::ProgressSlideshowDialog(const QStringList &slidesDirectories, const QString &statusMsg, int changeInterval, const QString &drive, QWidget *parent) :
     QDialog(parent),
+    _drive(drive),
     _pos(0),
     _changeInterval(changeInterval),
     _maxSectors(0),
@@ -121,6 +123,13 @@ void ProgressSlideshowDialog::resumeIOaccounting()
     _iotimer.start(1000);
 }
 
+void ProgressSlideshowDialog::changeDrive(const QString &drive)
+{
+    pauseIOaccounting();
+    _drive = drive;
+    resumeIOaccounting();
+}
+
 void ProgressSlideshowDialog::setMaximum(qint64 bytes)
 {
     _maxSectors = bytes/512;
@@ -167,7 +176,7 @@ int ProgressSlideshowDialog::sectorsWritten()
      * time_in_queue   milliseconds  total wait time for all requests
      */
 
-    QFile f("/sys/block/mmcblk0/stat");
+    QFile f(sysclassblock(_drive)+"/stat");
     f.open(f.ReadOnly);
     QByteArray ioline = f.readAll().simplified();
     f.close();

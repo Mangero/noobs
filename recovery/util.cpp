@@ -140,17 +140,36 @@ bool canBootOs(const QString& name, const QVariantMap& values)
     return true;
 }
 
-bool setRebootPartition(QByteArray partition)
+void setRebootPartition(QByteArray partition)
 {
-    if (QFileInfo("/sys/module/bcm2708/parameters/reboot_part").exists())
-    {
-        putFileContents("/sys/module/bcm2708/parameters/reboot_part", partition+"\n");
-        return true;
-    }
-    else if (QFileInfo("/sys/module/bcm2709/parameters/reboot_part").exists())
-    {
-        putFileContents("/sys/module/bcm2709/parameters/reboot_part", partition+"\n");
-        return true;
-    }
-    return false;
+    putFileContents("/run/reboot_part", partition+"\n");
+}
+
+/* Returns device name for drive and partition number
+ *
+ * partdev("mmcblk0",1) -> mmcblk0p1
+ * partdev("sda",2) -> sda2
+ */
+QByteArray partdev(const QString &drivedev, int nr)
+{
+    if (drivedev.right(1).at(0).isDigit())
+        return drivedev.toAscii()+"p"+QByteArray::number(nr);
+    else
+        return drivedev.toAscii()+QByteArray::number(nr);
+}
+
+/* Returns /sys/class/block path for given drive and optional partition number */
+QByteArray sysclassblock(const QString &drivedev, int partnr)
+{
+    QByteArray b;
+
+    if (partnr == -1)
+        b = drivedev.toAscii();
+    else
+        b = partdev(drivedev, partnr);
+
+    if (b.startsWith("/dev/"))
+        b = b.mid(5);
+
+    return "/sys/class/block/"+ b;
 }
